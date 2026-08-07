@@ -1,0 +1,16 @@
+services:
+  postgres: # This is the name of the container, not a special keyword. Could be "db".
+    image: postgres:16-alpine # Pinning version 16 ensures consistency across compose up and compose pull
+    container_name: transact-db 
+    restart: unless-stopped # Other options: always, on-failure
+    environment: # Defines environment variables est in the container
+      POSTGRES_USER: ${POSTGRES_USER} # With password, used to define root user. Default: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # This is the only variable required; the rest are optional
+      POSTGRES_DB: ${POSTGRES_DB} # Name for default database. Default: POSTGRES_USER
+    ports:
+      - "${POSTGRES_PORT}:5432" # Host Port : Container Port
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Named volume postgres_data is mounted to contianer path /var/lib/postgresql/data
+
+volumes:
+  postgres_data: # Create default local named volume called postgres_data if doesn't already exist

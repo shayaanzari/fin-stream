@@ -1,0 +1,7 @@
+# Local environment variables containing passwords
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/

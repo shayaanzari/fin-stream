@@ -1,0 +1,97 @@
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+  root_path: /bento
+  debug_endpoints: false
+  cert_file: ""
+  key_file: ""
+  cors:
+    enabled: false
+    allowed_origins: []
+    allowed_headers: []
+    allowed_methods:
+      - GET
+      - HEAD
+      - POST
+      - PUT
+      - PATCH
+      - DELETE
+  basic_auth:
+    enabled: false
+    realm: restricted
+    username: ""
+    password_hash: ""
+    algorithm: sha256
+    salt: ""
+input:
+  kafka:
+    addresses: [10.0.0.4:19092]
+    topics: ["HOMETX"]
+    consumer_group: "sz_trace" 
+    client_id: bento
+    rack_id: ""
+    start_from_oldest: true
+    checkpoint_limit: 1024
+    auto_replay_nacks: true
+    commit_period: 1s
+    max_processing_period: 100ms
+    extract_tracing_map: root = @ # No default (optional)
+    new_root_span_with_link: false # No default (optional)
+    group:
+      session_timeout: 10s
+      heartbeat_interval: 3s
+      rebalance_timeout: 60s
+    fetch_buffer_cap: 256
+    multi_header: false
+    debug: false
+    batching:
+      count: 0
+      byte_size: 0
+      period: ""
+      jitter: 0
+      check: ""
+      processors: [] # No default (optional)
+buffer:
+  none: {}
+
+pipeline:
+  threads: -1
+  processors:
+    - log:
+        message: 'Received message from partition ${! meta("kafka_partition") } at offset ${! meta("kafka_offset") }'
+output:
+  stdout: {}
+input_resources: []
+processor_resources: []
+output_resources: []
+cache_resources: []
+rate_limit_resources: []
+logger:
+  level: INFO
+  format: logfmt
+  add_timestamp: false
+  level_name: level
+  timestamp_name: time
+  message_name: msg
+  static_fields:
+    '@service': bento
+  file:
+    path: ""
+    rotate: false
+    rotate_max_age_days: 0
+  log_all_errors: false
+metrics:
+  prometheus: {}
+  mapping: ""
+tracer:
+  none: {}
+shutdown_delay: 0s
+shutdown_timeout: 20s
+error_handling:
+  strategy: none
+  log:
+    enabled: false
+    add_payload: false
+    sampling_ratio: 1
+tests: []
+
