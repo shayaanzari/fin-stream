@@ -25,7 +25,7 @@ services:
       postgres:
         condition: service_healthy
     env_file:
-      - .env
+      - stack.env
     ports:
       - "127.0.0.1:4195:4195"
     volumes:
