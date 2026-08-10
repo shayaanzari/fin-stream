@@ -5,3 +5,10 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Learning scripts
+regex.yml
+regex-with-kafka.yml
+
+# WIP
+process_transactions.py

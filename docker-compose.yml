@@ -11,6 +11,26 @@ services:
       - "${POSTGRES_PORT}:5432" # Host Port : Container Port
     volumes:
       - postgres_data:/var/lib/postgresql/data # Named volume postgres_data is mounted to contianer path /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bento:
+    image: ghcr.io/warpstreamlabs/bento:1.20.0
+    container_name: transact-bento
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:4195:4195"
+    volumes:
+      - ./config.yaml:/bento.yaml:ro
+    command: ["-c", "/bento.yaml"]
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist

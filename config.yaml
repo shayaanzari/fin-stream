@@ -34,7 +34,8 @@ input:
     checkpoint_limit: 1024
     auto_replay_nacks: true
     commit_period: 1s
-    max_processing_period: 100ms
+    # Covers the 10s readability pause plus the bounded SQL retry window.
+    max_processing_period: 90s
     extract_tracing_map: root = @ # No default (optional)
     new_root_span_with_link: false # No default (optional)
     group:
@@ -55,21 +56,285 @@ buffer:
   none: {}
 
 pipeline:
-  threads: -1
+  threads: 1 # default: -1. I assume it uses all it can?
   processors:
     - log:
+        level: INFO
         message: 'Received message from partition ${! meta("kafka_partition") } at offset ${! meta("kafka_offset") }'
+
+    - mapping: |
+        # 1. Normalize input string
+        let input_text = content().string().trim().trim("\"")
+
+        # 2. Extract timestamp at top-level with in-body date fallback
+        let dt = $input_text.re_find_all("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}")
+        let body_d4 = $input_text.re_find_all("on \\d{2}/\\d{2}/\\d{4}").index(0).catch("")
+        let body_d2 = $input_text.re_find_all("on \\d{2}/\\d{2}/\\d{2}").index(0).catch("")
+
+        let alert_dt = if $dt.length() > 0 {
+          $dt.index(0)
+        } else if $body_d4 != "" {
+          "%s-%s-%s 00:00:00".format(
+            $body_d4.replace("on ", "").split("/").index(2),
+            $body_d4.replace("on ", "").split("/").index(0),
+            $body_d4.replace("on ", "").split("/").index(1)
+          )
+        } else if $body_d2 != "" {
+          "20%s-%s-%s 00:00:00".format(
+            $body_d2.replace("on ", "").split("/").index(2),
+            $body_d2.replace("on ", "").split("/").index(0),
+            $body_d2.replace("on ", "").split("/").index(1)
+          )
+        } else {
+          "1970-01-01 00:00:00"
+        }
+
+        # 3. Match patterns using standard Bloblang regex operations
+        let parsed = match {
+          # Template 1: DCU Debit (Card Not Present)
+          $input_text.contains("Google Voice DCU:") && $input_text.contains("Card not present") => {
+            "bank": "DCU",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace("-", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all(" at .+?\\.\\s*If").index(0).catch(" at Unknown . If").replace(" at ", "").replace(" . If", "").replace(". If", "").trim(),
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Template 7: DCU Large Withdrawal / Internal Transfer
+          $input_text.contains("Google Voice DCU:") && $input_text.contains("LARGE WITHDRAWAL") => {
+            "bank": "DCU",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace("-", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all("LARGE WITHDRAWAL from .+? \\$-?").index(0).catch("LARGE WITHDRAWAL from Unknown $-").replace("LARGE WITHDRAWAL from ", "").replace(" $-", "").replace(" $", "").trim(),
+            "card_last_4": "0000"
+          },
+
+          # Template 8: DCU Pending Charge
+          $input_text.contains("Google Voice DCU:") && $input_text.contains("Pending charge") => {
+            "bank": "DCU",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all(" at .+? YOUR ACCOUNT HELP CENTER").index(0).catch(" at Unknown YOUR ACCOUNT HELP CENTER").replace(" at ", "").replace(" YOUR ACCOUNT HELP CENTER", "").trim(),
+            "card_last_4": $input_text.re_find_all("Message for [X\\s]*\\d{4}").index(0).catch("0000").re_find_all("\\d{4}").index(0).catch("0000")
+          },
+
+          # Template 2: Citi Debit (Card Not Present)
+          $input_text.contains("citi.com") && $input_text.contains("was not present") => {
+            "bank": "Citi",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all(" at .+?\\.\\s*View").index(0).catch(" at Unknown . View").replace(" at ", "").replace(" . View", "").replace(". View", "").trim(),
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Template 3: Citi Debit (Standard)
+          $input_text.contains("citi.com") && $input_text.contains("was made at") => {
+            "bank": "Citi",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all("made at .+? on card").index(0).catch("made at Unknown on card").replace("made at ", "").replace(" on card", "").trim(),
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Template 11: Citi Debit (International Transaction)
+          $input_text.contains("citi.com") && $input_text.contains("international transaction at") => {
+            "bank": "Citi",
+            "type": "PURCHASE",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all("international transaction at .+? was made on card").index(0).catch("international transaction at Unknown was made on card").replace("international transaction at ", "").replace(" was made on card", "").trim(),
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Templates 4 & 6: Citi Merchant Credits / Refunds
+          $input_text.contains("citi.com") && $input_text.contains(" credit from ") => {
+            "bank": "Citi",
+            "type": "CREDIT",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": $input_text.re_find_all("credit from .+? has posted").index(0).catch("credit from Unknown has posted").replace("credit from ", "").replace(" has posted", "").trim(),
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Template 9: Citi Account Deposit
+          $input_text.contains("citi.com") && $input_text.contains("deposit was made") => {
+            "bank": "Citi",
+            "type": "CREDIT",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": "Citi Deposit",
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Template 10: Citi Account Payment Posted
+          $input_text.contains("citi.com") && $input_text.contains("payment posted") => {
+            "bank": "Citi",
+            "type": "CREDIT",
+            "amount": $input_text.re_find_all("\\$-?[0-9,]+\\.\\d{2}").index(0).catch("$0.00").replace("$", "").replace(",", "").number().catch(0.00),
+            "vendor": "Citi Payment",
+            "card_last_4": $input_text.re_find_all("ending in \\d{4}").index(0).catch("ending in 0000").replace("ending in ", "")
+          },
+
+          # Fallback for unexpected formats
+          _ => {
+            "bank": "Unknown",
+            "type": "PURCHASE",
+            "amount": 0.00,
+            "vendor": "Unknown",
+            "card_last_4": "0000"
+          }
+        }
+
+        # 4. Filter out balance snapshots or output payload
+        root = if $input_text.re_match("has a balance of|Bal plus pending|attempted a login|Voice Tested|Statement is ready|bal on acct") {
+          deleted()
+        } else {
+          {
+            "raw_text": $input_text,
+            "alert_datetime": $alert_dt,
+            "bank": $parsed.bank,
+            "vendor": $parsed.vendor,
+            "amount": $parsed.amount,
+            "transaction_type": $parsed.type,
+            "card_last_4": $parsed.card_last_4,
+            "is_card_not_present": $input_text.lowercase().contains("not present"),
+            "failure_reason": if $parsed.bank == "Unknown" {
+              "unmatched_template"
+            } else {
+              null
+            }
+          }
+        }
+
+    - sleep:
+        duration: 10s
+
+    # Insert only successfully matched transactions. Failed inserts are handled
+    # below, where the original record can be routed to the DLQ.
+    - switch:
+        - check: 'this.failure_reason == null'
+          processors:
+            - label: transaction_insert_retry
+              retry:
+                max_retries: 5
+                backoff:
+                  initial_interval: 1s
+                  max_interval: 10s
+                  max_elapsed_time: 1m
+                processors:
+                  - resource: transaction_insert
+
+    # The catch block runs only after the bounded insert retry has failed and
+    # clears Bento's error flag after recording the reason on the message.
+    - catch:
+        - log:
+            level: ERROR
+            message: 'SQL_INSERT_FAILED partition=${! meta("kafka_partition") } offset=${! meta("kafka_offset") } error=${! error() }'
+        - mapping: |
+            let sql_error = error().lowercase()
+            root = this
+            meta dlq_error_detail = error()
+            root.failure_reason = if $sql_error.re_match("violates .+ constraint|duplicate key value|not-null constraint|foreign key constraint") {
+              "constraint_failed"
+            } else {
+              "database_write_failed"
+            }
+
+    - switch:
+        - check: 'this.failure_reason == null'
+          processors:
+            - log:
+                level: INFO
+                message: 'TRANSACTION_INSERTED partition=${! meta("kafka_partition") } offset=${! meta("kafka_offset") } bank=${! this.bank } amount=${! this.amount }'
+        - check: 'this.failure_reason != null'
+          processors:
+            - log:
+                level: WARN
+                message: 'TRANSACTION_DLQ partition=${! meta("kafka_partition") } offset=${! meta("kafka_offset") } reason=${! this.failure_reason }'
+
 output:
-  stdout: {}
+  label: route_transaction_result
+  switch:
+    strict_mode: true
+    cases:
+      - check: 'this.failure_reason != null'
+        output:
+          resource: transactions_dlq
+      - output:
+          drop: {}
 input_resources: []
-processor_resources: []
-output_resources: []
+processor_resources:
+  - label: transaction_insert
+    sql_insert:
+      driver: "postgres"
+      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=staging"
+      table: transactions
+      suffix: "ON CONFLICT (bank, card_last_4, alert_datetime, amount) DO NOTHING"
+      columns:
+        - "alert_datetime"
+        - "bank"
+        - "vendor"
+        - "amount"
+        - "transaction_type"
+        - "card_last_4"
+        - "is_card_not_present"
+        - "raw_text"
+      args_mapping: |
+        root = [
+          this.alert_datetime,
+          this.bank,
+          this.vendor,
+          this.amount,
+          this.transaction_type,
+          this.card_last_4,
+          this.is_card_not_present.or(false),
+          this.raw_text.string()
+        ]
+      init_statement: ""
+      init_verify_conn: false
+      credentials:
+        profile: ""
+        id: ""
+        secret: ""
+        token: ""
+        from_ec2_role: false
+        role: ""
+        role_external_id: ""
+        expiry_window: ""
+output_resources:
+  - label: transactions_dlq
+    sql_insert:
+      driver: "postgres"
+      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=staging"
+      table: transactions_dlq
+      columns:
+        - "raw_text"
+        - "error_reason"
+        - "error_detail"
+        - "kafka_partition"
+        - "kafka_offset"
+      args_mapping: |
+        root = [
+          this.raw_text.string(),
+          this.failure_reason.string(),
+          meta("dlq_error_detail"),
+          meta("kafka_partition").number(),
+          meta("kafka_offset").number()
+        ]
+      max_in_flight: 1
+      init_verify_conn: false
+      credentials:
+        profile: ""
+        id: ""
+        secret: ""
+        token: ""
+        from_ec2_role: false
+        role: ""
+        role_external_id: ""
+        expiry_window: ""
 cache_resources: []
 rate_limit_resources: []
 logger:
   level: INFO
   format: logfmt
-  add_timestamp: false
+  add_timestamp: true # what does this do?
   level_name: level
   timestamp_name: time
   message_name: msg
@@ -94,4 +359,3 @@ error_handling:
     add_payload: false
     sampling_ratio: 1
 tests: []
-
