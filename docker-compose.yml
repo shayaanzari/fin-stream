@@ -45,7 +45,7 @@ services:
       postgres:
         condition: service_healthy
     env_file:
-      - . env
+      - .env
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist
