@@ -1,2 +1,2 @@
-CREATE SCHEMA IF NOT EXISTS staging;
+CREATE SCHEMA IF NOT EXISTS bronze; -- formally staging
 CREATE SCHEMA IF NOT EXISTS silver;

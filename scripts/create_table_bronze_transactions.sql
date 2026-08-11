@@ -1,4 +1,4 @@
-SET search_path TO staging; -- You can alternatively do CREATE TABLE staging.transactions, but I like this more
+SET search_path TO bronze; -- You can alternatively do CREATE TABLE staging.transactions, but I like this more
 
 CREATE TABLE IF NOT EXISTS transactions (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

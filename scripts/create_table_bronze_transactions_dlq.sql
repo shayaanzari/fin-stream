@@ -1,4 +1,4 @@
-CREATE TABLE staging.transactions_dlq (
+CREATE TABLE bronze.transactions_dlq (
     dlq_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     raw_text         TEXT NOT NULL,
     error_reason     TEXT NOT NULL,

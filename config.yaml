@@ -264,7 +264,7 @@ processor_resources:
   - label: transaction_insert
     sql_insert:
       driver: "postgres"
-      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=staging"
+      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=bronze"
       table: transactions
       suffix: "ON CONFLICT (bank, card_last_4, alert_datetime, amount) DO NOTHING"
       columns:
@@ -302,7 +302,7 @@ output_resources:
   - label: transactions_dlq
     sql_insert:
       driver: "postgres"
-      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=staging"
+      dsn: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&search_path=bronze"
       table: transactions_dlq
       columns:
         - "raw_text"
