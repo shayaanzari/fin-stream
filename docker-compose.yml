@@ -1,7 +1,8 @@
 services:
+  # Off-the-shelf image
   postgres: # This is the name of the container, not a special keyword. Could be "db".
     image: postgres:16-alpine # Pinning version 16 ensures consistency across compose up and compose pull
-    container_name: transact-db 
+    container_name: transact-db
     restart: unless-stopped # Other options: always, on-failure
     environment: # Defines environment variables est in the container
       POSTGRES_USER: ${POSTGRES_USER} # With password, used to define root user. Default: postgres
@@ -17,8 +18,11 @@ services:
       timeout: 5s
       retries: 5
 
+  # Custom Application: built from a Dockerfile
   bento:
-    image: ghcr.io/warpstreamlabs/bento:1.20.0
+    build:
+      context: .
+      dockerfile: Dockerfile.bento
     container_name: transact-bento
     restart: unless-stopped
     depends_on:
@@ -28,9 +32,20 @@ services:
       - stack.env
     ports:
       - "127.0.0.1:4195:4195"
-    volumes:
-      - /home/izsnr/Sync/Files_SZ/projects/transact/config.yaml:/bento.yaml:ro
-    command: ["-c", "/bento.yaml"]
+
+
+  # Custom Application: built from a Dockerfile
+  silver:
+    build:
+      context: .
+      dockerfile: Dockerfile.silver
+    container_name: transact-silver
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - . env
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist

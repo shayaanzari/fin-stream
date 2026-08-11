@@ -1,0 +1,7 @@
+FROM ghcr.io/warpstreamlabs/bento:1.20.0
+
+# Copy the config into the image for production readiness
+COPY config.yaml /bento.yaml
+
+# The base image already has an entrypoint/cmd, but we ensure it points to our baked-in config
+CMD ["-c", "/bento.yaml"]
