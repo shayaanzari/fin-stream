@@ -23,6 +23,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.bento
+    pull_policy: build
     container_name: transact-bento
     restart: unless-stopped
     depends_on:
