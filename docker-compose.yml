@@ -35,17 +35,17 @@ services:
 
 
   # Custom Application: built from a Dockerfile
-  silver:
-    build:
-      context: .
-      dockerfile: Dockerfile.silver
-    container_name: transact-silver
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - stack.env
+#  silver:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile.silver
+#    container_name: transact-silver
+#    restart: unless-stopped
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#    env_file:
+#      - stack.env
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist
