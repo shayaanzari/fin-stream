@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 
     -- ── Silver enrichment columns ─────────────────────────────────────────────
     vendor_classification VARCHAR(100)  NOT NULL,                            -- LLM predicted category (e.g. 'Groceries', 'Dining')
-    confidence_score      NUMERIC(4,3)  CHECK (confidence_score BETWEEN 0 AND 1),  -- LLM confidence: 0.000–1.000
+    confidence_score      DOUBLE PRECISION CHECK (confidence_score BETWEEN 0 AND 1),  -- LLM confidence: 0.000–1.000
     llm_model_used        VARCHAR(100)  NOT NULL,                            -- Model provenance for auditing/comparison
     classified_at         TIMESTAMPTZ   NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
