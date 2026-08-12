@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install uv for fast dependency resolution
+RUN pip install --no-cache-dir uv
+
+# Copy dependency files first (layer caching)
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies (no dev extras, no editable mode)
+RUN uv sync --frozen --no-dev
+
+# Copy application code
+COPY silver/ ./silver/
+
+CMD ["uv", "run", "python", "-m", "silver.silver_flow"]
