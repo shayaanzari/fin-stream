@@ -40,6 +40,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.silver
+    #pull_policy: build
     container_name: transact-silver
     restart: unless-stopped
     depends_on:
@@ -47,6 +48,8 @@ services:
         condition: service_healthy
     env_file:
       - stack.env
+    environment:
+      PREFECT_SERVER_EPHEMERAL_STARTUP_TIMEOUT_SECONDS: "60"
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist

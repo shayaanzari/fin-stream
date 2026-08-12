@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     alert_datetime        TIMESTAMPTZ   NOT NULL,
     bank                  VARCHAR(50)   NOT NULL,
     vendor                VARCHAR(255)  NOT NULL,
-    amount                NUMERIC(10,2) NOT NULL CHECK (amount >= 0),
+    amount                DOUBLE PRECISION NOT NULL CHECK (amount >= 0),
     transaction_type      VARCHAR(20)   NOT NULL DEFAULT 'PURCHASE'
                               CHECK (transaction_type IN ('PURCHASE', 'CREDIT')),
     card_last_4           CHAR(4)       NOT NULL,

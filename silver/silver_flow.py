@@ -42,18 +42,20 @@ CATEGORIES = [
     "ATM/Cash", "Transfer", "Credit/Refund", "Other",
 ]
 
-# Columns to SELECT from bronze (all of them, renamed where needed)
+# Columns to SELECT from bronze (all of them, renamed where needed).
+# amount is cast to float because ADBC's copy writer does not support
+# writing Arrow double → PostgreSQL numeric; silver stores it as DOUBLE PRECISION.
 BRONZE_SELECT = """
-    b.id             AS bronze_id,
+    b.id                  AS bronze_id,
     b.alert_datetime,
     b.bank,
     b.vendor,
-    b.amount,
+    b.amount::float       AS amount,
     b.transaction_type,
     b.card_last_4,
     b.is_card_not_present,
     b.raw_text,
-    b.created_at     AS bronze_created_at
+    b.created_at          AS bronze_created_at
 """
 
 # ── Tasks ─────────────────────────────────────────────────────────────────────
@@ -143,7 +145,7 @@ def write_silver(enriched: list[dict]) -> int:
 
     df = pl.DataFrame(enriched).with_columns([
         pl.col("bronze_id").cast(pl.Int32),
-        pl.col("amount").cast(pl.Decimal(10, 2)),
+        # amount is already Float64 (fetched as amount::float); silver DDL uses DOUBLE PRECISION
         pl.col("confidence_score").cast(pl.Float64),
         pl.col("classified_at").cast(pl.Datetime("us", "UTC")),
     ])
