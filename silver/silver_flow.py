@@ -29,7 +29,7 @@ from silver.models import PredictionBatch, CATEGORIES
 # ── Config ────────────────────────────────────────────────────────────────────
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://10.0.0.81:4000/v1")
 LITELLM_API_KEY  = os.getenv("LITELLM_KEY", "")
-LLM_MODEL        = os.getenv("LLM_MODEL", "openrouter/openrouter/free")
+LLM_MODEL        = os.getenv("LLM_MODEL", "nemomoo")
 BATCH_SIZE       = int(os.getenv("SILVER_BATCH_SIZE", "25"))
 POLL_INTERVAL_S  = int(os.getenv("SILVER_POLL_INTERVAL_S", "60"))
 
@@ -100,6 +100,9 @@ def fetch_unclassified(limit: int = BATCH_SIZE) -> list[dict]:
 def classify_batch(rows: list[dict]) -> list[dict]:
     """Send a batch of vendor strings to the LLM, merge predictions back into full rows.
 
+    Uses OpenAI's beta.chat.completions.parse() to automatically parse and validate
+    output into a typed PredictionBatch Pydantic model.
+
     Returns only rows whose confidence score meets CONFIDENCE_THRESHOLD.
     Low-confidence rows are written to silver.transactions_dlq and excluded from the return value.
     On a full-batch API failure, returns [] so all rows stay in bronze for automatic retry.
@@ -116,12 +119,11 @@ def classify_batch(rows: list[dict]) -> list[dict]:
 
     system_prompt = (
         "You are a financial transaction classifier. "
-        f"Classify each of the {len(rows)} transactions below IN ORDER. "
-        "Return one prediction per line in the same order as the input. "
+        f"Classify each of the {len(rows)} transactions below IN EXACT ORDER into the schema.\n"
         f"Allowed categories: {', '.join(CATEGORIES)}."
     )
 
-    # ── Structured output: schema enforced at API level ──────────────────────
+    # ── Structured output: automatically validated into Pydantic model ───────
     try:
         response = client.beta.chat.completions.parse(
             model=LLM_MODEL,
@@ -133,7 +135,7 @@ def classify_batch(rows: list[dict]) -> list[dict]:
             temperature=0.0,
         )
     except Exception as exc:
-        # Full-batch failure: unsupported model, rate limit, network error, etc.
+        # Full-batch failure: schema parse error, API rate limit, network error, etc.
         # Leave rows in bronze — next poll cycle will retry them.
         logger.error(f"LLM API failure ({exc}); {len(rows)} rows left in bronze for retry")
         return []
@@ -221,8 +223,11 @@ def silver_flow():
         enriched = classify_batch(rows)
         written  = write_silver(enriched)
 
-        if written == 0:
-            logger.info(f"No new rows. Sleeping {POLL_INTERVAL_S}s …")
+        if not rows:
+            logger.info(f"No unclassified rows found in bronze. Sleeping {POLL_INTERVAL_S}s …")
+        elif written == 0:
+            logger.info(f"Batch processing deferred or sent to DLQ. Will retry next cycle in {POLL_INTERVAL_S}s …")
+        
         time.sleep(POLL_INTERVAL_S)
 
 

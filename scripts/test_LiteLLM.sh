@@ -2,10 +2,9 @@ curl http://10.0.0.81:4000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${LITELLM_KEY}" \
   -d '{
-    "model": "openrouter/openrouter/free",
+    "model": "nemomoo",
     "reasoning": {
-      "effort": "low",
-      "max_tokens": 100
+      "effort": "none"
     },
     "messages": [
       {
@@ -14,4 +13,5 @@ curl http://10.0.0.81:4000/v1/chat/completions \
       }
     ]
   }'
+
 

@@ -9,7 +9,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model=os.getenv("LLM_MODEL", "openrouter/openrouter/free"),
+    model=os.getenv("LLM_MODEL", "nemomoo"),
     messages=[
         {
             "role": "user",

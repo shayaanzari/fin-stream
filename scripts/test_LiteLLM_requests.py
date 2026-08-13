@@ -11,7 +11,7 @@ headers = {
 }
 
 payload = {
-    "model": "openrouter/openrouter/free",
+    "model": "nemomoo",
     # OpenRouter allows one of `effort' or 'max_tokens'.
     "reasoning": {
         "effort": "low" # none, low, medium, high
