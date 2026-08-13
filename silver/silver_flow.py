@@ -9,9 +9,12 @@ Flow:
   fetch_unclassified  → list[dict]  (full bronze rows not yet in silver)
   classify_batch      → list[dict]  (full rows + LLM predictions merged)
   write_silver        → int         (rows written)
+
+Failure disposition:
+  Full-batch API failure (error, length mismatch) → return [] → rows stay in bronze → retried next poll
+  Low-confidence result (confidence < CONFIDENCE_THRESHOLD) → silver.transactions_dlq
 """
 
-import json
 import os
 import time
 from datetime import datetime, timezone
@@ -21,12 +24,16 @@ from openai import OpenAI
 from prefect import flow, task, get_run_logger
 from prefect.tasks import exponential_backoff
 
+from silver.models import PredictionBatch, CATEGORIES
+
 # ── Config ────────────────────────────────────────────────────────────────────
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://10.0.0.81:4000/v1")
 LITELLM_API_KEY  = os.getenv("LITELLM_KEY", "")
 LLM_MODEL        = os.getenv("LLM_MODEL", "openrouter/openrouter/free")
 BATCH_SIZE       = int(os.getenv("SILVER_BATCH_SIZE", "25"))
 POLL_INTERVAL_S  = int(os.getenv("SILVER_POLL_INTERVAL_S", "60"))
+
+CONFIDENCE_THRESHOLD = 0.5  # minimum confidence score to write to silver; below this → DLQ
 
 DB_URI = (
     f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
@@ -35,12 +42,6 @@ DB_URI = (
 )
 
 client = OpenAI(base_url=LITELLM_BASE_URL, api_key=LITELLM_API_KEY)
-
-CATEGORIES = [
-    "Groceries", "Dining", "Subscriptions", "Travel", "Gas",
-    "Shopping", "Healthcare", "Entertainment", "Utilities",
-    "ATM/Cash", "Transfer", "Credit/Refund", "Other",
-]
 
 # Columns to SELECT from bronze (all of them, renamed where needed).
 # amount is cast to float because ADBC's copy writer does not support
@@ -58,6 +59,24 @@ BRONZE_SELECT = """
     b.created_at          AS bronze_created_at
 """
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _write_silver_dlq(dlq_rows: list[dict]) -> None:
+    """Persist low-confidence rows to silver.transactions_dlq for human review."""
+    logger = get_run_logger()
+    if not dlq_rows:
+        return
+    DLQ_COLS = ["bronze_id", "vendor", "amount", "transaction_type", "raw_text", "failure_reason"]
+    df = pl.DataFrame([{k: r[k] for k in DLQ_COLS} for r in dlq_rows])
+    df.write_database(
+        table_name="silver.transactions_dlq",
+        connection=DB_URI,
+        engine="adbc",
+        if_table_exists="append",
+    )
+    logger.warning(f"Wrote {len(dlq_rows)} row(s) to silver.transactions_dlq")
+
+
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
 @task(name="fetch-unclassified", retries=3, retry_delay_seconds=exponential_backoff(backoff_factor=2))
@@ -68,6 +87,7 @@ def fetch_unclassified(limit: int = BATCH_SIZE) -> list[dict]:
         SELECT {BRONZE_SELECT}
         FROM   bronze.transactions b
         WHERE  b.id NOT IN (SELECT bronze_id FROM silver.transactions)
+          AND  b.id NOT IN (SELECT bronze_id FROM silver.transactions_dlq)
         ORDER  BY b.alert_datetime ASC
         LIMIT  {limit}
     """
@@ -78,62 +98,92 @@ def fetch_unclassified(limit: int = BATCH_SIZE) -> list[dict]:
 
 @task(name="classify-batch", retries=2, retry_delay_seconds=10)
 def classify_batch(rows: list[dict]) -> list[dict]:
-    """Send a batch of vendor strings to the LLM, merge predictions back into full rows."""
+    """Send a batch of vendor strings to the LLM, merge predictions back into full rows.
+
+    Returns only rows whose confidence score meets CONFIDENCE_THRESHOLD.
+    Low-confidence rows are written to silver.transactions_dlq and excluded from the return value.
+    On a full-batch API failure, returns [] so all rows stay in bronze for automatic retry.
+    """
     logger = get_run_logger()
     if not rows:
         return []
 
-    # Build numbered prompt: "1. WHOLEFDS MKT 0483 | $47.23 | PURCHASE"
+    # Build ordered (un-numbered) prompt — position = identity
     items = "\n".join(
-        f"{i+1}. {r['vendor']} | ${r['amount']} | {r['transaction_type']}"
-        for i, r in enumerate(rows)
+        f"{r['vendor']} | ${r['amount']} | {r['transaction_type']}"
+        for r in rows
     )
 
     system_prompt = (
         "You are a financial transaction classifier. "
-        "For each numbered transaction, output ONLY a JSON array (one object per item) "
-        "with keys: 'index' (1-based int), 'vendor_classification' (string, one of the allowed categories), "
-        "'confidence_score' (float 0-1).\n"
-        f"Allowed categories: {', '.join(CATEGORIES)}.\n"
-        "Output raw JSON only — no markdown, no explanation."
+        f"Classify each of the {len(rows)} transactions below IN ORDER. "
+        "Return one prediction per line in the same order as the input. "
+        f"Allowed categories: {', '.join(CATEGORIES)}."
     )
 
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": items},
-        ],
-        temperature=0.0,
-    )
+    # ── Structured output: schema enforced at API level ──────────────────────
+    try:
+        response = client.beta.chat.completions.parse(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": items},
+            ],
+            response_format=PredictionBatch,
+            temperature=0.0,
+        )
+    except Exception as exc:
+        # Full-batch failure: unsupported model, rate limit, network error, etc.
+        # Leave rows in bronze — next poll cycle will retry them.
+        logger.error(f"LLM API failure ({exc}); {len(rows)} rows left in bronze for retry")
+        return []
 
-    raw = response.choices[0].message.content.strip()
+    batch: PredictionBatch | None = response.choices[0].message.parsed
     model_used = response.model
 
-    try:
-        predictions = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.error(f"LLM returned non-JSON: {raw[:200]}")
-        predictions = [
-            {"index": i+1, "vendor_classification": "Other", "confidence_score": 0.0}
-            for i in range(len(rows))
-        ]
+    if batch is None:
+        logger.error(f"LLM returned refusal/None; {len(rows)} rows left in bronze for retry")
+        return []
 
-    pred_map = {p["index"]: p for p in predictions}
-    enriched = []
-    for i, row in enumerate(rows):
-        pred = pred_map.get(i + 1, {"vendor_classification": "Other", "confidence_score": 0.0})
-        enriched.append({
-            # ── All bronze columns carried forward ───────────────────────────
-            **row,
-            # ── Silver enrichment columns appended ──────────────────────────
-            "vendor_classification": pred.get("vendor_classification", "Other"),
-            "confidence_score":      float(pred.get("confidence_score", 0.0)),
-            "llm_model_used":        model_used,
-            "classified_at":         datetime.now(timezone.utc),  # explicit UTC timestamp; not left to DB DEFAULT
-        })
+    # ── Length mismatch guard ────────────────────────────────────────────────
+    if len(batch.predictions) != len(rows):
+        logger.error(
+            f"LLM returned {len(batch.predictions)} predictions for {len(rows)} rows; "
+            "treating as full-batch failure — rows left in bronze for retry"
+        )
+        return []
 
-    logger.info(f"Classified {len(enriched)} rows via {model_used}")
+    # ── Confidence threshold fork ────────────────────────────────────────────
+    enriched, dlq_rows = [], []
+    now = datetime.now(timezone.utc)  # explicit UTC timestamp; not left to DB DEFAULT
+
+    for row, pred in zip(rows, batch.predictions):
+        if pred.c < CONFIDENCE_THRESHOLD:
+            dlq_rows.append({
+                **row,
+                "failure_reason": (
+                    f"low_confidence:{pred.c:.4f} "
+                    f"(category={pred.v}, threshold={CONFIDENCE_THRESHOLD})"
+                ),
+            })
+        else:
+            enriched.append({
+                # ── All bronze columns carried forward ───────────────────────
+                **row,
+                # ── Silver enrichment columns appended ──────────────────────
+                "vendor_classification": pred.v,
+                "confidence_score":      pred.c,
+                "llm_model_used":        model_used,
+                "classified_at":         now,
+            })
+
+    if dlq_rows:
+        _write_silver_dlq(dlq_rows)
+
+    logger.info(
+        f"Classified {len(enriched)} rows via {model_used}; "
+        f"{len(dlq_rows)} row(s) below confidence threshold → silver.transactions_dlq"
+    )
     return enriched
 
 

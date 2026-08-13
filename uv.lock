@@ -3096,6 +3096,7 @@ dependencies = [
     { name = "openai" },
     { name = "polars", extra = ["rtcompat"] },
     { name = "prefect" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "requests" },
 ]
@@ -3107,6 +3108,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.53.0" },
     { name = "polars", extras = ["rtcompat"], specifier = ">=1.43.2" },
     { name = "prefect", specifier = ">=3.8.2" },
+    { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "requests", specifier = ">=2.34.2" },
 ]

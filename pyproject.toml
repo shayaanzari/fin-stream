@@ -8,6 +8,7 @@ dependencies = [
     "openai>=2.53.0",
     "polars[rtcompat]>=1.43.2",
     "prefect>=3.8.2",
+    "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "requests>=2.34.2",
 ]
