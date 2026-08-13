@@ -173,7 +173,7 @@ def classify_batch(rows: list[dict]) -> list[dict]:
                 # ── Silver enrichment columns appended ──────────────────────
                 "vendor_classification": pred.v,
                 "confidence_score":      pred.c,
-                "llm_model_used":        model_used,
+                "llm":                   model_used,
                 "classified_at":         now,
             })
 
