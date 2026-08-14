@@ -133,8 +133,8 @@ def _predict_rows(rows: list[dict]) -> tuple[list[Prediction] | None, str | None
             response_format=PredictionBatch,
             temperature=0.0,
         )
-    except (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError) as exc:
-        raise exc  # Transient errors bubble up
+    except openai.APIError as exc:
+        raise exc  # All HTTP status codes (4xx, 5xx), timeouts, & connection drops bubble up
     except Exception as exc:
         # Pydantic validation error or JSON parsing error
         err_msg = f"Parse error: {type(exc).__name__} - {str(exc)}"
@@ -278,11 +278,33 @@ def silver_flow() -> int:
     return written
 
 
+def check_llm_connectivity() -> bool:
+    """Pre-flight check to verify LiteLLM connectivity, credentials, and model availability."""
+    import logging
+    daemon_logger = logging.getLogger("silver_poller")
+    daemon_logger.info(f"Testing LiteLLM connection at {LITELLM_BASE_URL} (model: '{LLM_MODEL}') …")
+    try:
+        client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            timeout=10.0,
+        )
+        daemon_logger.info(f"✅ LiteLLM connection verified (model: '{LLM_MODEL}')")
+        return True
+    except Exception as exc:
+        daemon_logger.warning(f"⚠️ LiteLLM pre-flight check failed ({type(exc).__name__}): {exc}")
+        return False
+
+
 def run_loop():
     """External polling loop executing discrete batch flow runs."""
     import logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     daemon_logger = logging.getLogger("silver_poller")
+
+    daemon_logger.info("Initializing Silver Poller Daemon …")
+    check_llm_connectivity()
 
     while True:
         try:
