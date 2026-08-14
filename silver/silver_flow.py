@@ -157,15 +157,26 @@ def _predict_rows(rows: list[dict]) -> tuple[list[Prediction] | None, str | None
     batch = response.choices[0].message.parsed
     model_used = response.model
 
-    logger.info(f"Using model: {model_used!r}")
-
     if batch is None:
+        finish_reason = response.choices[0].finish_reason
         refusal = getattr(response.choices[0].message, "refusal", None)
         raw_content = response.choices[0].message.content or ""
-        logger.warning(
-            f"Model refusal for batch of {len(rows)}. "
-            f"Refusal: {refusal!r}. Raw content: {raw_content[:500]!r}"
-        )
+        if refusal:
+            logger.warning(
+                f"Model refusal for batch of {len(rows)}: {refusal!r}"
+            )
+        elif finish_reason == "length":
+            logger.warning(
+                f"Token limit hit (finish_reason='length') for batch of {len(rows)}: "
+                f"structured output was truncated before completion. "
+                f"Consider reducing SILVER_BATCH_SIZE."
+            )
+        else:
+            logger.warning(
+                f"Null structured output for batch of {len(rows)} "
+                f"(finish_reason={finish_reason!r}, content={raw_content[:200]!r}). "
+                f"Model did not produce a parseable response."
+            )
         return None, model_used, "parse_error"
 
     if len(batch.predictions) != len(rows):
@@ -200,6 +211,7 @@ def classify_batch(rows: list[dict]) -> list[dict]:
     
     try:
         # 1. Attempt bulk classification
+        logger.info(f"Sending {len(rows)} row(s) to {LLM_MODEL!r} …")
         predictions, model_used, err_reason = _predict_rows(rows)
         
         # 2. Fallback to row-by-row if bulk fails (Sad Path Isolation)
@@ -211,7 +223,7 @@ def classify_batch(rows: list[dict]) -> list[dict]:
             predictions = []
 
             for i, row in enumerate(rows, start=1):
-                logger.info(f"Row-by-row [{i}/{len(rows)}]: vendor={row['vendor']!r}")
+                logger.info(f"Attempting row [{i}/{len(rows)}]: vendor={row['vendor']!r}")
                 single_pred, single_model, single_err = _predict_rows([row])
                 model_used = single_model or model_used
 
@@ -224,6 +236,10 @@ def classify_batch(rows: list[dict]) -> list[dict]:
                     })
                     predictions.append(None) # Keep index alignment
                 else:
+                    logger.info(
+                        f"Row [{i}/{len(rows)}] → {single_pred[0].v!r} "
+                        f"(conf={single_pred[0].c:.2f})"
+                    )
                     predictions.append(single_pred[0])
 
     except Exception as exc:
@@ -300,7 +316,7 @@ def write_silver(enriched: list[dict]) -> int:
 def silver_flow() -> int:
     """Single-batch Prefect flow: fetch → classify → write."""
     logger = get_run_logger()
-    logger.info(f"Using model: {LLM_MODEL!r} | batch_size={BATCH_SIZE} | poll_interval={POLL_INTERVAL_S}s")
+    logger.info(f"batch_size={BATCH_SIZE} | poll_interval={POLL_INTERVAL_S}s")
     rows = fetch_unclassified(limit=BATCH_SIZE)
     if not rows:
         logger.info("No unclassified rows found in bronze.")
