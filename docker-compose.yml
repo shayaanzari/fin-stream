@@ -50,6 +50,8 @@ services:
       - stack.env
     environment:
       PREFECT_SERVER_EPHEMERAL_STARTUP_TIMEOUT_SECONDS: "60"
+      PREFECT_API_DATABASE_CONNECTION_URL: "sqlite+aiosqlite:///:memory:"
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
 
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist

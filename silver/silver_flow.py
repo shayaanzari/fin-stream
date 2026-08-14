@@ -20,15 +20,16 @@ import time
 from datetime import datetime, timezone
 
 import polars as pl
+import openai
 from openai import OpenAI
 from prefect import flow, task, get_run_logger
 from prefect.tasks import exponential_backoff
 
-from silver.models import PredictionBatch, CATEGORIES
+from silver.models import PredictionBatch, Prediction, CATEGORIES
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://10.0.0.81:4000/v1")
-LITELLM_API_KEY  = os.getenv("LITELLM_KEY", "")
+LITELLM_API_KEY  = os.getenv("LITELLM_KEY") or "sk-dummy"
 LLM_MODEL        = os.getenv("LLM_MODEL", "nemomoo")
 BATCH_SIZE       = int(os.getenv("SILVER_BATCH_SIZE", "25"))
 POLL_INTERVAL_S  = int(os.getenv("SILVER_POLL_INTERVAL_S", "60"))
@@ -67,7 +68,13 @@ def _write_silver_dlq(dlq_rows: list[dict]) -> None:
     if not dlq_rows:
         return
     DLQ_COLS = ["bronze_id", "vendor", "amount", "transaction_type", "raw_text", "failure_reason"]
-    df = pl.DataFrame([{k: r[k] for k in DLQ_COLS} for r in dlq_rows])
+    df = (
+        pl.DataFrame([{k: r[k] for k in DLQ_COLS} for r in dlq_rows])
+        .with_columns([
+            pl.col("bronze_id").cast(pl.Int32),
+            pl.col("amount").cast(pl.Float64),
+        ])
+    )
     df.write_database(
         table_name="silver.transactions_dlq",
         connection=DB_URI,
@@ -86,8 +93,8 @@ def fetch_unclassified(limit: int = BATCH_SIZE) -> list[dict]:
     query = f"""
         SELECT {BRONZE_SELECT}
         FROM   bronze.transactions b
-        WHERE  b.id NOT IN (SELECT bronze_id FROM silver.transactions)
-          AND  b.id NOT IN (SELECT bronze_id FROM silver.transactions_dlq)
+        WHERE  NOT EXISTS (SELECT 1 FROM silver.transactions     s WHERE s.bronze_id = b.id)
+          AND  NOT EXISTS (SELECT 1 FROM silver.transactions_dlq d WHERE d.bronze_id = b.id)
         ORDER  BY b.alert_datetime ASC
         LIMIT  {limit}
     """
@@ -96,22 +103,15 @@ def fetch_unclassified(limit: int = BATCH_SIZE) -> list[dict]:
     return df.to_dicts()
 
 
-@task(name="classify-batch", retries=2, retry_delay_seconds=10)
-def classify_batch(rows: list[dict]) -> list[dict]:
-    """Send a batch of vendor strings to the LLM, merge predictions back into full rows.
-
-    Uses OpenAI's beta.chat.completions.parse() to automatically parse and validate
-    output into a typed PredictionBatch Pydantic model.
-
-    Returns only rows whose confidence score meets CONFIDENCE_THRESHOLD.
-    Low-confidence rows are written to silver.transactions_dlq and excluded from the return value.
-    On a full-batch API failure, returns [] so all rows stay in bronze for automatic retry.
+def _predict_rows(rows: list[dict]) -> tuple[list[Prediction] | None, str | None, str | None]:
+    """Helper to classify a specific number of rows.
+    Returns (predictions, model_name, None) on success.
+    Returns (None, model_name, error_reason) on parse error, length mismatch, or refusal.
+    Raises transient API errors (e.g., openai.RateLimitError) to be caught by the caller.
     """
-    logger = get_run_logger()
     if not rows:
-        return []
+        return [], None, None
 
-    # Build ordered (un-numbered) prompt — position = identity
     items = "\n".join(
         f"{r['vendor']} | ${r['amount']} | {r['transaction_type']}"
         for r in rows
@@ -123,7 +123,6 @@ def classify_batch(rows: list[dict]) -> list[dict]:
         f"Allowed categories: {', '.join(CATEGORIES)}."
     )
 
-    # ── Structured output: automatically validated into Pydantic model ───────
     try:
         response = client.beta.chat.completions.parse(
             model=LLM_MODEL,
@@ -134,39 +133,87 @@ def classify_batch(rows: list[dict]) -> list[dict]:
             response_format=PredictionBatch,
             temperature=0.0,
         )
+    except (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError) as exc:
+        raise exc  # Transient errors bubble up
     except Exception as exc:
-        # Full-batch failure: schema parse error, API rate limit, network error, etc.
-        # Leave rows in bronze — next poll cycle will retry them.
-        logger.error(f"LLM API failure ({exc}); {len(rows)} rows left in bronze for retry")
-        return []
+        # Pydantic validation error or JSON parsing error
+        err_msg = f"Parse error: {type(exc).__name__} - {str(exc)}"
+        get_run_logger().warning(f"Parse error for batch of {len(rows)}: {exc}")
+        return None, None, err_msg
 
-    batch: PredictionBatch | None = response.choices[0].message.parsed
+    batch = response.choices[0].message.parsed
     model_used = response.model
 
-    if batch is None:
-        logger.error(f"LLM returned refusal/None; {len(rows)} rows left in bronze for retry")
+    if batch is None or len(batch.predictions) != len(rows):
+        err_msg = f"Length mismatch or refusal: got {len(batch.predictions) if batch else 0} for {len(rows)} rows"
+        get_run_logger().warning(f"Length mismatch or refusal for batch of {len(rows)}")
+        return None, model_used, err_msg
+
+    return batch.predictions, model_used, None
+
+
+@task(name="classify-batch", retries=2, retry_delay_seconds=10)
+def classify_batch(rows: list[dict]) -> list[dict]:
+    """Send a batch of vendor strings to the LLM, merge predictions back into full rows.
+
+    Uses OpenAI's beta.chat.completions.parse() to automatically parse and validate
+    output into a typed PredictionBatch Pydantic model.
+
+    Implements a fallback mechanism: If a bulk batch (e.g. 25) fails to parse, 
+    it falls back to processing row-by-row to isolate the poison pill transaction 
+    into the DLQ without blocking the rest of the batch.
+    """
+    logger = get_run_logger()
+    if not rows:
         return []
 
-    # ── Length mismatch guard ────────────────────────────────────────────────
-    if len(batch.predictions) != len(rows):
-        logger.error(
-            f"LLM returned {len(batch.predictions)} predictions for {len(rows)} rows; "
-            "treating as full-batch failure — rows left in bronze for retry"
-        )
-        return []
-
-    # ── Confidence threshold fork ────────────────────────────────────────────
     enriched, dlq_rows = [], []
-    now = datetime.now(timezone.utc)  # explicit UTC timestamp; not left to DB DEFAULT
+    now = datetime.now(timezone.utc)
+    
+    try:
+        # 1. Attempt bulk classification
+        predictions, model_used, err_reason = _predict_rows(rows)
+        
+        # 2. Fallback to row-by-row if bulk fails (Sad Path Isolation)
+        if predictions is None:
+            logger.warning(f"Bulk parse failed for {len(rows)} rows. Falling back to row-by-row isolation.")
+            predictions = []
+            
+            for row in rows:
+                single_pred, single_model, single_err = _predict_rows([row])
+                model_used = single_model or model_used
+                
+                if single_pred is None:
+                    # Isolated the poison pill!
+                    logger.error(f"Isolated poison pill: '{row['vendor']}' failed parsing.")
+                    dlq_rows.append({
+                        **row,
+                        "failure_reason": single_err
+                    })
+                    predictions.append(None) # Keep index alignment
+                else:
+                    predictions.append(single_pred[0])
+                    
+    except Exception as exc:
+        # Transient API error bubbled up (RateLimit, Connection, etc.)
+        # Returning [] aborts the batch completely, leaving any unprocessed/processed rows in bronze for retry
+        logger.error(f"Transient LLM API failure ({type(exc).__name__}); leaving rows in bronze for retry.")
+        return []
 
-    for row, pred in zip(rows, batch.predictions):
-        if pred.c < CONFIDENCE_THRESHOLD:
+    # 3. Process predictions (confidence fork)
+    for row, pred in zip(rows, predictions):
+        if pred is None:
+            continue # Already handled (put in DLQ as parse error)
+            
+        if pred.c < CONFIDENCE_THRESHOLD or pred.v == "Other":
+            if pred.v == "Other":
+                reason = f"category_is_other (conf={pred.c:.4f})"
+            else:
+                reason = f"low_confidence:{pred.c:.4f} (threshold={CONFIDENCE_THRESHOLD})"
+                
             dlq_rows.append({
                 **row,
-                "failure_reason": (
-                    f"low_confidence:{pred.c:.4f} "
-                    f"(category={pred.v}, threshold={CONFIDENCE_THRESHOLD})"
-                ),
+                "failure_reason": reason
             })
         else:
             enriched.append({
@@ -184,7 +231,7 @@ def classify_batch(rows: list[dict]) -> list[dict]:
 
     logger.info(
         f"Classified {len(enriched)} rows via {model_used}; "
-        f"{len(dlq_rows)} row(s) below confidence threshold → silver.transactions_dlq"
+        f"{len(dlq_rows)} row(s) below confidence threshold or unparseable → silver.transactions_dlq"
     )
     return enriched
 
@@ -215,21 +262,39 @@ def write_silver(enriched: list[dict]) -> int:
 # ── Flow ──────────────────────────────────────────────────────────────────────
 
 @flow(name="silver-enrichment-flow", log_prints=True)
-def silver_flow():
-    """Top-level Prefect flow: fetch → classify → write, then sleep."""
+def silver_flow() -> int:
+    """Single-batch Prefect flow: fetch → classify → write."""
     logger = get_run_logger()
-    while True:
-        rows     = fetch_unclassified(limit=BATCH_SIZE)
-        enriched = classify_batch(rows)
-        written  = write_silver(enriched)
+    rows = fetch_unclassified(limit=BATCH_SIZE)
+    if not rows:
+        logger.info("No unclassified rows found in bronze.")
+        return 0
 
-        if not rows:
-            logger.info(f"No unclassified rows found in bronze. Sleeping {POLL_INTERVAL_S}s …")
-        elif written == 0:
-            logger.info(f"Batch processing deferred or sent to DLQ. Will retry next cycle in {POLL_INTERVAL_S}s …")
-        
-        time.sleep(POLL_INTERVAL_S)
+    enriched = classify_batch(rows)
+    written = write_silver(enriched)
+
+    if written == 0:
+        logger.info("Batch processing deferred or sent to DLQ.")
+    return written
+
+
+def run_loop():
+    """External polling loop executing discrete batch flow runs."""
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    daemon_logger = logging.getLogger("silver_poller")
+
+    while True:
+        try:
+            silver_flow()
+            time.sleep(POLL_INTERVAL_S)
+        except KeyboardInterrupt:
+            daemon_logger.info("Polling loop stopped by user.")
+            break
+        except Exception as exc:
+            daemon_logger.error(f"Unexpected error in batch cycle: {exc}. Retrying in {POLL_INTERVAL_S}s …")
+            time.sleep(POLL_INTERVAL_S)
 
 
 if __name__ == "__main__":
-    silver_flow()
+    run_loop()

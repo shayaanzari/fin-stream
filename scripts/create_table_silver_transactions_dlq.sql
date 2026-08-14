@@ -19,5 +19,6 @@ CREATE TABLE IF NOT EXISTS transactions_dlq (
     created_at       TIMESTAMPTZ      NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_silver_dlq_bronze_id  ON transactions_dlq (bronze_id);
+-- Prevent duplicate DLQ entries for the same bronze row
+CREATE UNIQUE INDEX IF NOT EXISTS uq_silver_dlq_bronze_id ON transactions_dlq (bronze_id);
 CREATE INDEX IF NOT EXISTS idx_silver_dlq_created_at ON transactions_dlq (created_at DESC);
