@@ -19,6 +19,7 @@ import os
 import time
 from datetime import datetime, timezone
 
+import pydantic
 import polars as pl
 import openai
 from openai import OpenAI
@@ -67,12 +68,17 @@ def _write_silver_dlq(dlq_rows: list[dict]) -> None:
     logger = get_run_logger()
     if not dlq_rows:
         return
-    DLQ_COLS = ["bronze_id", "vendor", "amount", "transaction_type", "raw_text", "failure_reason"]
+    DLQ_COLS = [
+        "bronze_id", "vendor", "amount", "transaction_type", "raw_text",
+        "vendor_classification", "confidence_score", "llm",
+        "failure_reason",
+    ]
     df = (
-        pl.DataFrame([{k: r[k] for k in DLQ_COLS} for r in dlq_rows])
+        pl.DataFrame([{k: r.get(k) for k in DLQ_COLS} for r in dlq_rows])
         .with_columns([
             pl.col("bronze_id").cast(pl.Int32),
             pl.col("amount").cast(pl.Float64),
+            pl.col("confidence_score").cast(pl.Float64),
         ])
     )
     df.write_database(
@@ -109,6 +115,7 @@ def _predict_rows(rows: list[dict]) -> tuple[list[Prediction] | None, str | None
     Returns (None, model_name, error_reason) on parse error, length mismatch, or refusal.
     Raises transient API errors (e.g., openai.RateLimitError) to be caught by the caller.
     """
+    logger = get_run_logger()
     if not rows:
         return [], None, None
 
@@ -135,19 +142,40 @@ def _predict_rows(rows: list[dict]) -> tuple[list[Prediction] | None, str | None
         )
     except openai.APIError as exc:
         raise exc  # All HTTP status codes (4xx, 5xx), timeouts, & connection drops bubble up
+    except pydantic.ValidationError as exc:
+        details = "; ".join(
+            f"field={'.'.join(str(loc) for loc in e['loc'])!r} "
+            f"got={e.get('input')!r} ({e['msg']})"
+            for e in exc.errors()
+        )
+        logger.warning(f"Pydantic ValidationError for batch of {len(rows)}: {details}")
+        return None, None, "parse_error"
     except Exception as exc:
-        # Pydantic validation error or JSON parsing error
-        err_msg = f"Parse error: {type(exc).__name__} - {str(exc)}"
-        get_run_logger().warning(f"Parse error for batch of {len(rows)}: {exc}")
-        return None, None, err_msg
+        logger.warning(f"Parse error ({type(exc).__name__}) for batch of {len(rows)}: {exc}")
+        return None, None, "parse_error"
 
     batch = response.choices[0].message.parsed
     model_used = response.model
 
-    if batch is None or len(batch.predictions) != len(rows):
-        err_msg = f"Length mismatch or refusal: got {len(batch.predictions) if batch else 0} for {len(rows)} rows"
-        get_run_logger().warning(f"Length mismatch or refusal for batch of {len(rows)}")
-        return None, model_used, err_msg
+    logger.info(f"Using model: {model_used!r}")
+
+    if batch is None:
+        refusal = getattr(response.choices[0].message, "refusal", None)
+        raw_content = response.choices[0].message.content or ""
+        logger.warning(
+            f"Model refusal for batch of {len(rows)}. "
+            f"Refusal: {refusal!r}. Raw content: {raw_content[:500]!r}"
+        )
+        return None, model_used, "parse_error"
+
+    if len(batch.predictions) != len(rows):
+        raw_content = response.choices[0].message.content or ""
+        logger.warning(
+            f"Length mismatch for batch of {len(rows)}: "
+            f"expected {len(rows)}, got {len(batch.predictions)}. "
+            f"Raw content (first 500 chars): {raw_content[:500]!r}"
+        )
+        return None, model_used, "parse_error"
 
     return batch.predictions, model_used, None
 
@@ -176,24 +204,28 @@ def classify_batch(rows: list[dict]) -> list[dict]:
         
         # 2. Fallback to row-by-row if bulk fails (Sad Path Isolation)
         if predictions is None:
-            logger.warning(f"Bulk parse failed for {len(rows)} rows. Falling back to row-by-row isolation.")
+            logger.warning(
+                f"Bulk classify failed ({err_reason}). "
+                f"Falling back to {len(rows)} individual LLM calls."
+            )
             predictions = []
-            
-            for row in rows:
+
+            for i, row in enumerate(rows, start=1):
+                logger.info(f"Row-by-row [{i}/{len(rows)}]: vendor={row['vendor']!r}")
                 single_pred, single_model, single_err = _predict_rows([row])
                 model_used = single_model or model_used
-                
+
                 if single_pred is None:
                     # Isolated the poison pill!
                     logger.error(f"Isolated poison pill: '{row['vendor']}' failed parsing.")
                     dlq_rows.append({
                         **row,
-                        "failure_reason": single_err
+                        "failure_reason": "parse_error",
                     })
                     predictions.append(None) # Keep index alignment
                 else:
                     predictions.append(single_pred[0])
-                    
+
     except Exception as exc:
         # Transient API error bubbled up (RateLimit, Connection, etc.)
         # Returning [] aborts the batch completely, leaving any unprocessed/processed rows in bronze for retry
@@ -204,16 +236,19 @@ def classify_batch(rows: list[dict]) -> list[dict]:
     for row, pred in zip(rows, predictions):
         if pred is None:
             continue # Already handled (put in DLQ as parse error)
-            
+
         if pred.c < CONFIDENCE_THRESHOLD or pred.v == "Other":
             if pred.v == "Other":
-                reason = f"category_is_other (conf={pred.c:.4f})"
+                reason = "category_is_other"
             else:
-                reason = f"low_confidence:{pred.c:.4f} (threshold={CONFIDENCE_THRESHOLD})"
-                
+                reason = "low_confidence"
+
             dlq_rows.append({
                 **row,
-                "failure_reason": reason
+                "vendor_classification": pred.v,
+                "confidence_score":      pred.c,
+                "llm":                   model_used,
+                "failure_reason":        reason,
             })
         else:
             enriched.append({
@@ -265,6 +300,7 @@ def write_silver(enriched: list[dict]) -> int:
 def silver_flow() -> int:
     """Single-batch Prefect flow: fetch → classify → write."""
     logger = get_run_logger()
+    logger.info(f"Using model: {LLM_MODEL!r} | batch_size={BATCH_SIZE} | poll_interval={POLL_INTERVAL_S}s")
     rows = fetch_unclassified(limit=BATCH_SIZE)
     if not rows:
         logger.info("No unclassified rows found in bronze.")
@@ -309,6 +345,7 @@ def run_loop():
     while True:
         try:
             silver_flow()
+            daemon_logger.info(f"Batch complete. Sleeping {POLL_INTERVAL_S}s until next poll …")
             time.sleep(POLL_INTERVAL_S)
         except KeyboardInterrupt:
             daemon_logger.info("Polling loop stopped by user.")

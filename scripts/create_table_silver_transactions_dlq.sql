@@ -10,10 +10,13 @@ CREATE TABLE IF NOT EXISTS transactions_dlq (
     transaction_type VARCHAR(20)      NOT NULL,
     raw_text         TEXT             NOT NULL,
 
+    -- LLM output snapshot (NULL if the model returned nothing parseable)
+    vendor_classification VARCHAR(100)     NULL,
+    confidence_score      DOUBLE PRECISION NULL CHECK (confidence_score BETWEEN 0 AND 1),
+    llm                   VARCHAR(100)     NULL,
+
     -- Failure context
-    -- Examples:
-    --   "low_confidence:0.0000 (category=Groceries, threshold=0.5)"
-    --   "low_confidence:0.3500 (category=Other, threshold=0.5)"
+    -- Enum-like values: "low_confidence" | "category_is_other" | "parse_error"
     failure_reason   TEXT             NOT NULL,
 
     created_at       TIMESTAMPTZ      NOT NULL DEFAULT CURRENT_TIMESTAMP
