@@ -53,5 +53,28 @@ services:
       PREFECT_API_DATABASE_CONNECTION_URL: "sqlite+aiosqlite:///:memory:"
       PREFECT_SERVER_ANALYTICS_ENABLED: "false"
 
+  # Off-the-shelf image: Grafana Visualization & Dashboarding
+  grafana:
+    image: grafana/grafana-oss:11.1.0
+    container_name: transact-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data: # Create default local named volume called postgres_data if doesn't already exist
+  grafana_data:
