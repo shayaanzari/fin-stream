@@ -32,7 +32,7 @@ from silver.models import PredictionBatch, Prediction, CATEGORIES
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://10.0.0.81:4000/v1")
 LITELLM_API_KEY  = os.getenv("LITELLM_KEY") or "sk-dummy"
 LLM_MODEL        = os.getenv("LLM_MODEL", "nemomoo")
-BATCH_SIZE       = int(os.getenv("SILVER_BATCH_SIZE", "25"))
+BATCH_SIZE       = int(os.getenv("SILVER_BATCH_SIZE", "10"))
 POLL_INTERVAL_S  = int(os.getenv("SILVER_POLL_INTERVAL_S", "60"))
 
 CONFIDENCE_THRESHOLD = 0.5  # minimum confidence score to write to silver; below this → DLQ
