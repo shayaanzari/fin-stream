@@ -8,6 +8,10 @@ I built it to deepen skills in stream processing, SQL data modeling, Python orch
 
 Python · Polars · Pydantic · PostgreSQL · SQL · Apache Arrow ADBC · OpenAI · LiteLLM · Prefect · Bento · Redpanda/Kafka · Grafana · Docker Compose
 
+## Dashboard
+<img width="1920" height="933" alt="Screenshot From 2026-08-22 11-48-23" src="https://github.com/user-attachments/assets/a8f062dd-64f5-4e7b-8ff9-bbc27a96ea48" />
+
+
 ## What it does
 
 ```text
